@@ -1,0 +1,43 @@
+name: Isolated PR1353 merge inspection
+on:
+  push:
+    branches: [validation/pr1353-merge-20260924]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.repository == 'sankalpsthakur/carbon-erp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Inspect pinned public refs without modifying either branch
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+          EXPECTED_HEAD: cd2604fb310f55967345523081135dc5eff60738
+          EXPECTED_BASE: d492091e3060107d3dd334554196a47d14ddee22
+          EXPECTED_COMMON: e8afdb4d9f123c3eac50e9fbe14fdae2322eb4c0
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/pr1353-source"
+          cd "$RUNNER_TEMP/pr1353-source"
+          git init -q
+          git -c credential.helper= fetch --quiet --no-tags --depth=256 https://github.com/crbnos/carbon.git refs/heads/main
+          base=$(git rev-parse FETCH_HEAD)
+          test "$base" = "$EXPECTED_BASE"
+          git -c credential.helper= fetch --quiet --no-tags --depth=256 https://github.com/sankalpsthakur/carbon-erp.git refs/heads/fix/1009-bulk-employee-invite
+          head=$(git rev-parse FETCH_HEAD)
+          test "$head" = "$EXPECTED_HEAD"
+          common=$(git merge-base "$head" "$base")
+          test "$common" = "$EXPECTED_COMMON"
+          printf 'HEAD=%s\nBASE=%s\nCOMMON=%s\n' "$head" "$base" "$common"
+          set +e
+          git merge-tree --write-tree --name-only "$head" "$base" > "$RUNNER_TEMP/pr1353-merge.txt"
+          result=$?
+          set -e
+          test "$result" -le 1
+          printf 'MERGE_TREE_EXIT=%s (0=clean, 1=conflicts; not a test result)\n' "$result"
+          cat "$RUNNER_TEMP/pr1353-merge.txt"
+          printf '\nUPSTREAM CHANGES TO PR-CHANGED FILES\n'
+          git diff --name-only -z "$common" "$head" | xargs -0 -r git diff --stat "$common" "$base" --
+          printf '\nNo repository tests, source corrections, commits, pushes, deployments or migrations were run by this job.\n'

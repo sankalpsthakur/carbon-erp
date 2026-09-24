@@ -1,5 +1,0 @@
-{
-  "title": "Self-hosting",
-  "defaultOpen": true,
-  "pages": ["docker-caddy", "aws-sst", "environment-variables"]
-}
