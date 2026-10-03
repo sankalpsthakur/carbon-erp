@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: Carbon open PR merge inspection (no tests)
+on:
+  push:
+    branches: [validation/carbon-open-prs-20261003]
+    paths: [.github/workflows/carbon-merge-inspection.yml]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    if: github.repository == 'sankalpsthakur/carbon-erp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 1352
+            head: 6c679df1bad6e77535eda23f14d487827270190e
+          - pr: 1353
+            head: faf8bce8f65d6d2d075e90d54f6bb5f969d1c1fc
+    env:
+      PR_NUMBER: ${{ matrix.pr }}
+      TARGET_SHA: ${{ matrix.head }}
+    steps:
+      - name: Fetch real source and inspect three-way merge without committing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git init src
+          git -C src remote add origin https://github.com/sankalpsthakur/carbon-erp.git
+          git -C src remote add upstream https://github.com/crbnos/carbon.git
+          git -C src fetch --no-tags origin "$TARGET_SHA"
+          git -C src checkout --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = "$TARGET_SHA"
+          git -C src fetch --no-tags upstream main
+          git -C src config user.name 'Isolated validation runner'
+          git -C src config user.email 'validation@localhost.invalid'
+          python3 - <<'PY'
+          import json, os, subprocess
+          from pathlib import Path
+          def git(*args, check=True):
+              return subprocess.run(['git', '-C', 'src', *args], capture_output=True, check=check)
+          def text(*args):
+              return git(*args).stdout.decode().strip()
+          out = Path('evidence')
+          head = text('rev-parse', 'HEAD')
+          upstream = text('rev-parse', 'refs/remotes/upstream/main')
+          base = text('merge-base', head, upstream)
+          changed = git('diff', '--name-only', '-z', base, head).stdout.decode().split('\0')
+          changed = {p for p in changed if p}
+          (out / 'pr.patch').write_bytes(git('diff', '--binary', base, head).stdout)
+          merge = git('merge', '--no-commit', '--no-ff', upstream, check=False)
+          (out / 'merge.log').write_bytes(merge.stdout + merge.stderr)
+          if merge.returncode not in (0, 1):
+              raise RuntimeError(f'Git merge failed with exit {merge.returncode}')
+          conflicts = [p for p in git('diff', '--name-only', '--diff-filter=U', '-z').stdout.decode().split('\0') if p]
+          (out / 'unmerged-index.txt').write_bytes(git('ls-files', '-u').stdout)
+          (out / 'working-tree.patch').write_bytes(git('diff', '--binary', 'HEAD').stdout)
+          (out / 'staged-upstream.patch').write_bytes(git('diff', '--cached', '--binary').stdout)
+          paths = changed | set(conflicts) | {
+              'package.json', 'pnpm-workspace.yaml', 'turbo.json', '.nvmrc', '.npmrc',
+              'apps/erp/package.json', 'apps/erp/turbo.json', '.ai/lessons.md',
+          }
+          for ref in (head, upstream):
+              names = git('ls-tree', '-r', '--name-only', ref).stdout.decode().splitlines()
+              paths.update(p for p in names if p.endswith('AGENTS.md') or p.startswith('.claude/rules/') or p.startswith('.github/workflows/'))
+          for label, ref in [('head', head), ('upstream', upstream), ('merge-base', base)]:
+              for path in sorted(paths):
+                  data = git('show', f'{ref}:{path}', check=False)
+                  if data.returncode == 0:
+                      dest = out / label / path
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      dest.write_bytes(data.stdout)
+          for path in conflicts:
+              for stage in (1, 2, 3):
+                  data = git('show', f':{stage}:{path}', check=False)
+                  if data.returncode == 0:
+                      dest = out / f'stage-{stage}' / path
+                      dest.parent.mkdir(parents=True, exist_ok=True)
+                      dest.write_bytes(data.stdout)
+              src = Path('src') / path
+              if src.is_file():
+                  dest = out / 'conflicted' / path
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(src.read_bytes())
+          record = {'pr': int(os.environ['PR_NUMBER']), 'head': head, 'upstream': upstream,
+                    'merge_base': base, 'merge_exit': merge.returncode, 'conflicts': conflicts,
+                    'pr_changed_paths': sorted(changed), 'tests_executed': False,
+                    'source_commits_created': False, 'pushed': False}
+          (out / 'manifest.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('## Merge inspection only — not test validation\n\n```json\n' + json.dumps(record, indent=2) + '\n```\n')
+          PY
+      - name: Retain exact conflicts and source context
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbon-${{ matrix.pr }}-merge-inspection
+          path: evidence/
+          retention-days: 14
+          include-hidden-files: true
+          if-no-files-found: error
