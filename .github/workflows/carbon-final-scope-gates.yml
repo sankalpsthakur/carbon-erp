@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: Carbon candidate final scope gates
+on:
+  push:
+    branches: [validation/carbon-open-prs-20261003]
+    paths: [.github/workflows/carbon-final-scope-gates.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  scope:
+    if: github.repository == 'sankalpsthakur/carbon-erp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: [1352, 1353]
+    env:
+      PR_NUMBER: ${{ matrix.pr }}
+      UPSTREAM_SHA: 4952e5b3721a904c2e5d51c7d97e895f01b17fc7
+      NODE_OPTIONS: --max-old-space-size=6144
+      TURBO_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download exact prior candidate receipt
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: carbon-${{ matrix.pr }}-resolved-candidate
+          path: prior
+          repository: sankalpsthakur/carbon-erp
+          run-id: 37094310498
+          github-token: ${{ github.token }}
+      - name: Reconstruct the identical tested tree
+        id: source
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git init src
+          git -C src remote add origin https://github.com/crbnos/carbon.git
+          git -C src fetch --no-tags origin "$UPSTREAM_SHA"
+          git -C src checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          m=json.loads(Path('prior/validation.json').read_text())
+          heads={1352:'6c679df1bad6e77535eda23f14d487827270190e',1353:'faf8bce8f65d6d2d075e90d54f6bb5f969d1c1fc'}
+          assert m['pr']==int(os.environ['PR_NUMBER'])
+          assert m['head']==heads[m['pr']] and m['upstream']==os.environ['UPSTREAM_SHA']
+          assert m['all_required_checks_passed']
+          patch=Path('prior/candidate-vs-upstream.patch')
+          assert hashlib.sha256(patch.read_bytes()).hexdigest()==m['patch_sha256']
+          subprocess.run(['git','-C','src','apply','--index',str(patch.resolve())],check=True)
+          tree=subprocess.check_output(['git','-C','src','write-tree'],text=True).strip()
+          assert tree==m['candidate_tree'], (tree,m['candidate_tree'])
+          Path('evidence/primary-validation.json').write_text(json.dumps(m,indent=2)+'\n')
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.33.4
+          run_install: false
+      - name: Install the same locked workspace
+        id: install
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile 2>&1 | tee ../evidence/install.log
+      - name: Touched locale and content package typechecks
+        id: types
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm --filter @carbon/locale typecheck 2>&1 | tee ../evidence/locale-typecheck.log
+          if [ "$PR_NUMBER" = 1353 ]; then
+            pnpm --filter @carbon/content typecheck 2>&1 | tee ../evidence/content-typecheck.log
+          fi
+      - name: Repository conformance checks
+        id: conformance
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm --filter @carbon/config build 2>&1 | tee ../evidence/config-build.log
+          pnpm --filter @carbon/checks exec vitest run src/run.test.ts 2>&1 | tee ../evidence/conformance.log
+      - name: Official missing-translation check and exact upstream comparison
+        id: i18n
+        continue-on-error: true
+        working-directory: src
+        run: |
+          node --input-type=module <<'JS'
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {execFileSync,spawnSync} from 'node:child_process';
+          import {parsePo,readLocaleConfig} from './.claude/skills/translate/scripts/lib-po.mjs';
+          import {buildMatcher,glossaryForItems,loadGlossary} from './.claude/skills/translate/scripts/lib-glossary.mjs';
+          const {codes}=readLocaleConfig('packages/locale/src/config.ts',readFileSync);
+          const saved=new Map(), comparisons=[];
+          const glossary=loadGlossary(), matcher=buildMatcher(glossary);
+          for(const locale of codes.filter(c=>c!=='en')) for(const catalog of ['erp','mes']) {
+            const path=`packages/locale/locales/${locale}/${catalog}.po`;
+            const current=readFileSync(path,'utf8');
+            const baseline=execFileSync('git',['show',`${process.env.UPSTREAM_SHA}:${path}`],{encoding:'utf8'});
+            saved.set(path,{current,baseline});
+            const missing=s=>new Set(parsePo(s).entries.filter(e=>e.msgid!==''&&e.msgstr==='').map(e=>e.msgid));
+            const before=missing(baseline), after=missing(current);
+            const added=[...after].filter(s=>!before.has(s)).sort();
+            comparisons.push({locale,catalog,baseline_missing:before.size,candidate_missing:after.size,
+              newly_missing:added,resolved:[...before].filter(s=>!after.has(s)).sort(),
+              glossary_for_new:glossaryForItems(added,locale,glossary,matcher)});
+          }
+          const run=()=>spawnSync('pnpm',['exec','linguito','check'],{encoding:'utf8',env:{...process.env,NO_COLOR:'1',FORCE_COLOR:'0'}});
+          const candidate=run(); let baseline;
+          try {
+            for(const [path,{baseline: text}] of saved) writeFileSync(path,text);
+            baseline=run();
+          } finally {
+            for(const [path,{current}] of saved) writeFileSync(path,current);
+          }
+          const output=r=>(r.stdout||'')+(r.stderr||'');
+          writeFileSync('../evidence/linguito-candidate.log',output(candidate));
+          writeFileSync('../evidence/linguito-upstream.log',output(baseline));
+          const newCount=comparisons.reduce((n,c)=>n+c.newly_missing.length,0);
+          const equivalent=candidate.status===baseline.status&&output(candidate).trim()===output(baseline).trim();
+          const record={candidate_exit:candidate.status,upstream_exit:baseline.status,
+            global_check_passed:candidate.status===0,exact_output_equivalent:equivalent,
+            newly_missing_total:newCount,comparisons};
+          writeFileSync('../evidence/i18n-baseline-comparison.json',JSON.stringify(record,null,2)+'\n');
+          console.log(JSON.stringify(record,null,2));
+          if(newCount || (candidate.status!==0&&!equivalent)) process.exitCode=1;
+          JS
+      - name: Verify tree stayed unchanged and retain outcomes
+        if: always()
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          python3 - <<'PY'
+          import json,os,subprocess
+          from pathlib import Path
+          out=Path('evidence');out.mkdir(exist_ok=True)
+          steps=json.loads(os.environ['STEPS_JSON'])
+          checks={k:steps.get(k,{}).get('outcome','not_run') for k in ['source','install','types','conformance','i18n']}
+          m=json.loads(Path('prior/validation.json').read_text())
+          clean=False
+          if Path('src/.git').exists():
+            dirty=subprocess.check_output(['git','-C','src','diff','--name-only'],text=True)
+            clean=not dirty.strip()
+            (out/'unexpected-source-changes.txt').write_text(dirty)
+          r={'pr':m['pr'],'candidate_tree':m['candidate_tree'],'checks':checks,
+             'candidate_unchanged':clean,'all_scope_gates_passed':clean and all(v=='success' for v in checks.values()),
+             'feature_refs_updated':False}
+          (out/'scope-validation.json').write_text(json.dumps(r,indent=2)+'\n')
+          print(json.dumps(r,indent=2))
+          PY
+      - name: Retain gate receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbon-${{ matrix.pr }}-final-scope-gates
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Require final scope gates
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('evidence/scope-validation.json').read_text())
+          if not r['all_scope_gates_passed']:
+            raise SystemExit('Scope gates require attention: '+str(r))
+          PY
