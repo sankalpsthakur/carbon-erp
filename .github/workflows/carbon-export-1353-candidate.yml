@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: Export verified Carbon 1353 candidate
+on:
+  push:
+    branches: [validation/carbon-open-prs-20261003]
+    paths: [.github/workflows/carbon-export-1353-candidate.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    if: github.repository == 'sankalpsthakur/carbon-erp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: carbon-1353-resolved-candidate
+          path: prior
+          repository: sankalpsthakur/carbon-erp
+          run-id: 37094310498
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: carbon-1353-final-scope-gates
+          path: scope
+          repository: sankalpsthakur/carbon-erp
+          run-id: 37094962434
+          github-token: ${{ github.token }}
+      - name: Create and export only the verified candidate commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64,hashlib,json,os,subprocess
+          from pathlib import Path
+          head='faf8bce8f65d6d2d075e90d54f6bb5f969d1c1fc'
+          upstream='4952e5b3721a904c2e5d51c7d97e895f01b17fc7'
+          expected_tree='71065d1b4399b464848abd893aaf9605fcfdf215'
+          expected_patch='35e58687f226a0978c324411bab46865ee4397950f5ebc9c283b20c10178328b'
+          branch='candidate/carbon-1353-20261003'
+          feature='fix/1009-bulk-employee-invite'
+          primary=json.loads(Path('prior/validation.json').read_text())
+          scope=json.loads(Path('scope/scope-validation.json').read_text())
+          i18n=json.loads(Path('scope/i18n-baseline-comparison.json').read_text())
+          assert primary['pr']==scope['pr']==1353
+          assert primary['head']==head and primary['upstream']==upstream
+          assert primary['all_required_checks_passed'] and scope['all_scope_gates_passed']
+          assert primary['candidate_tree']==scope['candidate_tree']==expected_tree
+          assert i18n['newly_missing_total']==0
+          assert i18n['global_check_passed'] or i18n['exact_output_equivalent']
+          patch=Path('prior/candidate-vs-upstream.patch').resolve()
+          assert hashlib.sha256(patch.read_bytes()).hexdigest()==expected_patch==primary['patch_sha256']
+          def git(*args,input=None,env=None):
+              return subprocess.run(['git','-C','src',*args],input=input,text=True,capture_output=True,check=True,env=env).stdout.strip()
+          subprocess.run(['git','init','src'],check=True)
+          git('remote','add','origin','https://github.com/sankalpsthakur/carbon-erp.git')
+          git('remote','add','upstream','https://github.com/crbnos/carbon.git')
+          assert git('ls-remote','origin','refs/heads/'+feature).split()[0]==head, 'PR head changed'
+          assert not git('ls-remote','origin','refs/heads/'+branch), 'Candidate branch already exists; do not overwrite'
+          git('fetch','--no-tags','origin',head)
+          git('fetch','--no-tags','upstream',upstream)
+          git('checkout','--detach',upstream)
+          git('apply','--index',str(patch))
+          tree=git('write-tree')
+          assert tree==expected_tree
+          git('diff','--cached','--check')
+          git('config','user.name','Sankalp Thakur')
+          git('config','user.email','31366524+sankalpsthakur@users.noreply.github.com')
+          message=('fix(users): reconcile bulk invitations with current upstream\n\n'
+            'Preserve the existing permission and role policy, the bulk-invite redirect,\n'
+            'and the old-modal deletion. Retain current license headers and glossary location.\n\n'
+            'Verified tree: '+tree+'\n'
+            'Validation: runs 37094310498 and 37094962434.\n'
+            '19 focused tests; repository test tasks, typechecks, lint and production build pass.\n'
+            'Existing missing translations reproduce identically upstream; no new missing strings.\n\n'
+            'AI assistance: OpenAI ChatGPT\n')
+          commit=git('commit-tree',tree,'-p',head,'-p',upstream,input=message)
+          env=os.environ.copy()
+          token=env.pop('GH_TOKEN')
+          auth=base64.b64encode(('x-access-token:'+token).encode()).decode()
+          env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
+                     GIT_CONFIG_VALUE_0='AUTHORIZATION: basic '+auth,GIT_TERMINAL_PROMPT='0',GIT_TRACE='0',GIT_CURL_VERBOSE='0')
+          git('push','origin',commit+':refs/heads/'+branch,env=env)
+          assert git('ls-remote','origin','refs/heads/'+branch).split()[0]==commit
+          record={'pr':1353,'candidate_branch':branch,'commit':commit,'tree':tree,
+                  'original_head':head,'upstream':upstream,'feature_branch':feature,
+                  'feature_refs_updated':False,'global_i18n_clean':i18n['global_check_passed'],
+                  'upstream_i18n_exception_exactly_reproduced':i18n['exact_output_equivalent']}
+          Path('export-receipt.json').write_text(json.dumps(record,indent=2)+'\n')
+          print(json.dumps(record,indent=2))
+          PY
+      - name: Retain isolated export receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbon-1353-isolated-export
+          path: export-receipt.json
+          retention-days: 14
+          if-no-files-found: error
