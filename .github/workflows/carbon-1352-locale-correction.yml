@@ -1,0 +1,292 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: Carbon 1352 invoice notice localization
+on:
+  push:
+    branches: [validation/carbon-open-prs-20261003]
+    paths: [.github/workflows/carbon-1352-locale-correction.yml]
+permissions:
+  contents: read
+  actions: read
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/carbon-erp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      UPSTREAM_SHA: 4952e5b3721a904c2e5d51c7d97e895f01b17fc7
+      NODE_OPTIONS: --max-old-space-size=6144
+      TURBO_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: carbon-1352-resolved-candidate
+          path: prior
+          repository: sankalpsthakur/carbon-erp
+          run-id: 37094310498
+          github-token: ${{ github.token }}
+      - name: Reconstruct exact previously tested candidate
+        id: source
+        run: |
+          set -euo pipefail
+          mkdir evidence
+          git init src
+          git -C src remote add origin https://github.com/crbnos/carbon.git
+          git -C src fetch --no-tags origin "$UPSTREAM_SHA"
+          git -C src checkout --detach FETCH_HEAD
+          python3 - <<'PY'
+          import hashlib,json,subprocess
+          from pathlib import Path
+          m=json.loads(Path('prior/validation.json').read_text())
+          assert m['pr']==1352 and m['all_required_checks_passed']
+          assert m['head']=='6c679df1bad6e77535eda23f14d487827270190e'
+          assert m['upstream']=='4952e5b3721a904c2e5d51c7d97e895f01b17fc7'
+          patch=Path('prior/candidate-vs-upstream.patch').resolve()
+          assert hashlib.sha256(patch.read_bytes()).hexdigest()==m['patch_sha256']=='e15726f745128e2f2875b30c81ca4e25522ae204a31592c6fe555f63053d7f88'
+          subprocess.run(['git','-C','src','apply','--index',str(patch)],check=True)
+          tree=subprocess.check_output(['git','-C','src','write-tree'],text=True).strip()
+          assert tree==m['candidate_tree']=='56402b0d88a7ad2ffdb5661ae9f613e7a7fefb0f'
+          Path('evidence/primary-validation.json').write_text(json.dumps(m,indent=2)+'\n')
+          PY
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.33.4
+          run_install: false
+      - name: Install locked dependencies
+        id: install
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile 2>&1 | tee ../evidence/install.log
+      - name: Fill only eight new empty translations through official merger
+        id: translate
+        working-directory: src
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import {mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+          import {parsePo} from './.claude/skills/translate/scripts/lib-po.mjs';
+          const msgid='{currencyMismatchCount, plural, one {Excludes # invoice in a different currency.} other {Excludes # invoices in a different currency.}}';
+          const translations={
+            fr:'{currencyMismatchCount, plural, one {Exclut # facture dans une autre devise.} other {Exclut # factures dans une autre devise.}}',
+            ja:'{currencyMismatchCount, plural, one {異なる通貨の請求書 # 件を除外します。} other {異なる通貨の請求書 # 件を除外します。}}',
+            pl:'{currencyMismatchCount, plural, one {Pomija # fakturę w innej walucie.} other {Pomija faktury w innej walucie: #.}}',
+            ru:'{currencyMismatchCount, plural, one {Не учитывается # счет-фактура в другой валюте.} other {Не учитываются счета-фактуры в другой валюте: #.}}',
+            zh:'{currencyMismatchCount, plural, one {不包含 # 张以其他货币计价的发票。} other {不包含 # 张以其他货币计价的发票。}}',
+            hi:'{currencyMismatchCount, plural, one {भिन्न मुद्रा वाले # चालान को शामिल नहीं किया गया है।} other {भिन्न मुद्रा वाले # चालानों को शामिल नहीं किया गया है।}}',
+            tr:'{currencyMismatchCount, plural, one {Farklı para birimindeki # fatura hariç tutulur.} other {Farklı para birimindeki # fatura hariç tutulur.}}',
+            ko:'{currencyMismatchCount, plural, one {다른 통화로 표시된 송장 #건을 제외합니다.} other {다른 통화로 표시된 송장 #건을 제외합니다.}}'
+          };
+          const dir=process.cwd()+'/.ai/scratch/translate';
+          mkdirSync(dir+'/out',{recursive:true});
+          const manifest=[];
+          for(const [locale,text] of Object.entries(translations)) {
+            const entries=parsePo(readFileSync(`packages/locale/locales/${locale}/erp.po`,'utf8')).entries;
+            const entry=entries.filter(e=>e.msgid===msgid);
+            assert.equal(entry.length,1); assert.equal(entry[0].msgstr,'');
+            const out=dir+'/out/'+locale+'.json';
+            writeFileSync(out,JSON.stringify({[msgid]:text},null,2)+'\n');
+            manifest.push({locale,catalog:'erp',out});
+          }
+          writeFileSync(dir+'/manifest.json',JSON.stringify(manifest,null,2)+'\n');
+          writeFileSync('../evidence/targeted-translations.json',JSON.stringify({msgid,translations},null,2)+'\n');
+          JS
+          node .claude/skills/translate/scripts/merge-translations.mjs 2>&1 | tee ../evidence/merge-translations.log
+          grep -F 'Merged: 8 filled, 0 unmatched' ../evidence/merge-translations.log
+          pnpm run lingui:clean 2>&1 | tee ../evidence/lingui-clean.log
+          pnpm run lingui:compile 2>&1 | tee ../evidence/lingui-compile.log
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import {readFileSync,rmSync,writeFileSync} from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          import {parsePo} from './.claude/skills/translate/scripts/lib-po.mjs';
+          const {msgid,translations}=JSON.parse(readFileSync('../evidence/targeted-translations.json','utf8'));
+          const expected=Object.keys(translations).map(l=>`packages/locale/locales/${l}/erp.po`).sort();
+          const actual=execFileSync('git',['diff','--name-only'],{encoding:'utf8'}).trim().split('\n').sort();
+          assert.deepEqual(actual,expected);
+          const receipts=[];
+          for(const path of expected) {
+            const before=execFileSync('git',['show',':'+path],{encoding:'utf8'});
+            const after=readFileSync(path,'utf8');
+            const a=parsePo(before).entries,b=parsePo(after).entries;
+            assert.equal(a.length,b.length);
+            let changed=0;
+            for(let i=0;i<a.length;i++) {
+              assert.equal(a[i].msgid,b[i].msgid);
+              if(a[i].msgstr!==b[i].msgstr) {
+                assert.equal(a[i].msgid,msgid); assert.equal(a[i].msgstr,'');
+                assert.equal(b[i].msgstr,translations[path.split('/')[3]]); changed++;
+              }
+            }
+            assert.equal(changed,1); receipts.push({path,changed_entries:changed});
+          }
+          writeFileSync('../evidence/translation-scope.json',JSON.stringify(receipts,null,2)+'\n');
+          rmSync('.ai/scratch/translate',{recursive:true,force:true});
+          JS
+          git diff --check
+      - name: Validate actual compiled plural messages
+        id: runtime
+        working-directory: src
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {createRequire} from 'node:module';
+          import {resolve} from 'node:path';
+          import {pathToFileURL} from 'node:url';
+          const require=createRequire(resolve('apps/erp/package.json'));
+          const {setupI18n}=require('@lingui/core');
+          const {translations}=JSON.parse(readFileSync('../evidence/targeted-translations.json','utf8'));
+          const en=await import(pathToFileURL(resolve('packages/locale/locales/en/erp.mjs')));
+          const ids=Object.entries(en.messages).filter(([id,m])=>JSON.stringify(m).includes('invoice in a different currency.')).map(([id])=>id);
+          assert.equal(ids.length,1);
+          const receipts=[];
+          for(const locale of Object.keys(translations)) {
+            const {messages}=await import(pathToFileURL(resolve(`packages/locale/locales/${locale}/erp.mjs`)));
+            assert.ok(messages[ids[0]]);
+            const i18n=setupI18n({locale,messages:{[locale]:messages}});
+            for(const n of [0,1,2,5,21]) {
+              const output=i18n._(ids[0],{currencyMismatchCount:n});
+              assert.ok(output.includes(String(n)),`${locale}/${n}: count missing: ${output}`);
+              assert.ok(!output.includes('Excludes')&&!output.includes('#')&&!output.includes('{currencyMismatchCount'));
+              receipts.push({locale,count:n,output});
+            }
+          }
+          writeFileSync('../evidence/plural-runtime.json',JSON.stringify(receipts,null,2)+'\n');
+          console.log(JSON.stringify(receipts,null,2));
+          JS
+      - name: Locale typecheck and repository formatting
+        id: types
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm --filter @carbon/locale typecheck 2>&1 | tee ../evidence/locale-typecheck.log
+          pnpm exec biome check 2>&1 | tee ../evidence/biome.log
+      - name: Repeat focused invoice regressions
+        id: focused
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm --filter erp exec vitest run \
+            app/modules/invoicing/invoicing.application-history.test.ts \
+            app/modules/invoicing/invoicing.models.test.ts \
+            app/modules/invoicing/invoicing.summary-loaders.test.ts \
+            'app/routes/x+/sales-order+/$orderId.invoice-summary.test.ts' \
+            --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused-tests.json" \
+            2>&1 | tee ../evidence/focused-tests.log
+      - name: Production build with corrected catalogs (no deployment)
+        id: build
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm exec turbo run build --concurrency=2 2>&1 | tee ../evidence/production-build.log
+      - name: Prove no newly missing translations against pristine upstream
+        id: i18n
+        working-directory: src
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import {readFileSync,writeFileSync} from 'node:fs';
+          import {execFileSync,spawnSync} from 'node:child_process';
+          import {parsePo,readLocaleConfig} from './.claude/skills/translate/scripts/lib-po.mjs';
+          const {codes}=readLocaleConfig('packages/locale/src/config.ts',readFileSync);
+          const saved=new Map(),comparisons=[];
+          for(const locale of codes.filter(c=>c!=='en')) for(const catalog of ['erp','mes']) {
+            const path=`packages/locale/locales/${locale}/${catalog}.po`;
+            const current=readFileSync(path,'utf8');
+            const baseline=execFileSync('git',['show',`${process.env.UPSTREAM_SHA}:${path}`],{encoding:'utf8'});
+            saved.set(path,{current,baseline});
+            const missing=s=>new Set(parsePo(s).entries.filter(e=>e.msgid!==''&&e.msgstr==='').map(e=>e.msgid));
+            const before=missing(baseline),after=missing(current);
+            comparisons.push({locale,catalog,baseline_missing:before.size,candidate_missing:after.size,
+              newly_missing:[...after].filter(s=>!before.has(s)).sort()});
+          }
+          const run=()=>spawnSync('pnpm',['exec','linguito','check'],{encoding:'utf8',env:{...process.env,NO_COLOR:'1',FORCE_COLOR:'0'}});
+          const candidate=run(); let baseline;
+          try {
+            for(const [path,{baseline:text}] of saved) writeFileSync(path,text);
+            baseline=run();
+          } finally {
+            for(const [path,{current}] of saved) writeFileSync(path,current);
+          }
+          const output=r=>(r.stdout||'')+(r.stderr||'');
+          writeFileSync('../evidence/linguito-candidate.log',output(candidate));
+          writeFileSync('../evidence/linguito-upstream.log',output(baseline));
+          const equivalent=candidate.status===baseline.status&&output(candidate).trim()===output(baseline).trim();
+          const record={candidate_exit:candidate.status,upstream_exit:baseline.status,
+            global_check_passed:candidate.status===0,exact_output_equivalent:equivalent,
+            newly_missing_total:comparisons.reduce((n,c)=>n+c.newly_missing.length,0),comparisons};
+          writeFileSync('../evidence/i18n-baseline-comparison.json',JSON.stringify(record,null,2)+'\n');
+          console.log(JSON.stringify(record,null,2));
+          assert.equal(record.newly_missing_total,0);
+          assert.ok(candidate.status===0||equivalent,'Remaining failures must match pristine upstream exactly');
+          JS
+      - name: Retain exact final candidate and truthful outcomes
+        if: always()
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          out=Path('evidence');out.mkdir(exist_ok=True)
+          steps=json.loads(os.environ['STEPS_JSON'])
+          checks={k:steps.get(k,{}).get('outcome','not_run') for k in ['source','install','translate','runtime','types','focused','build','i18n']}
+          r={'pr':1352,'head':'6c679df1bad6e77535eda23f14d487827270190e','upstream':os.environ['UPSTREAM_SHA'],
+             'checks':checks,'all_correction_checks_passed':all(v=='success' for v in checks.values()),
+             'primary_full_test_run_reused':37094310498,'scope_typecheck_conformance_run_reused':37094962434,
+             'feature_refs_updated':False,'human_review_certified':False}
+          if (out/'focused-tests.json').exists():
+            data=json.loads((out/'focused-tests.json').read_text())
+            r['focused_test_counts']={k:data.get(k) for k in ['numTotalTests','numPassedTests','numFailedTests','numPendingTests']}
+            r['all_correction_checks_passed'] &= data.get('numPassedTests',0)>=71 and data.get('numFailedTests',0)==0
+          if Path('src/.git').exists():
+            def git(*args):
+              p=subprocess.run(['git','-C','src',*args],capture_output=True,check=True)
+              return p.stdout
+            expected=[f'packages/locale/locales/{l}/erp.po' for l in ['fr','ja','pl','ru','zh','hi','tr','ko']]
+            dirty={p for p in git('diff','--name-only').decode().splitlines() if p}
+            r['unexpected_source_changes']=sorted(dirty-set(expected))
+            r['all_correction_checks_passed'] &= not r['unexpected_source_changes']
+            if not r['unexpected_source_changes']:
+              git('add','--',*expected)
+              r['candidate_tree']=git('write-tree').decode().strip()
+              patch=git('diff','--cached','--binary','--no-renames',os.environ['UPSTREAM_SHA'])
+              (out/'candidate-vs-upstream.patch').write_bytes(patch)
+              r['patch_sha256']=hashlib.sha256(patch).hexdigest()
+              (out/'locale-only-correction.patch').write_bytes(git('diff','--cached','--binary','56402b0d88a7ad2ffdb5661ae9f613e7a7fefb0f'))
+              names=git('diff','--cached','--name-status','--no-renames','-z',os.environ['UPSTREAM_SHA']).decode().split('\0')
+              changes=[]
+              for i in range(0,len(names)-1,2):
+                status,path=names[i:i+2];changes.append({'status':status,'path':path})
+                if status!='D':
+                  dest=out/'candidate-files'/path;dest.parent.mkdir(parents=True,exist_ok=True)
+                  dest.write_bytes(git('show',':'+path))
+              r['changed_files']=changes
+          (out/'validation.json').write_text(json.dumps(r,indent=2)+'\n')
+          print(json.dumps(r,indent=2))
+          PY
+      - name: Retain correction, compiled-message receipts and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbon-1352-localized-candidate
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Require correction gates
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          r=json.loads(Path('evidence/validation.json').read_text())
+          if not r['all_correction_checks_passed']:
+            raise SystemExit('Correction remains unverified: '+str(r['checks']))
+          PY
