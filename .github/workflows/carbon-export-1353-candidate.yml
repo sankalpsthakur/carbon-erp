@@ -84,14 +84,20 @@ jobs:
           auth=base64.b64encode(('x-access-token:'+token).encode()).decode()
           env.update(GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='http.https://github.com/.extraheader',
                      GIT_CONFIG_VALUE_0='AUTHORIZATION: basic '+auth,GIT_TERMINAL_PROMPT='0',GIT_TRACE='0',GIT_CURL_VERBOSE='0')
-          git('push','origin',commit+':refs/heads/'+branch,env=env)
-          assert git('ls-remote','origin','refs/heads/'+branch).split()[0]==commit
+          result=subprocess.run(['git','-C','src','push','origin',commit+':refs/heads/'+branch],text=True,capture_output=True,env=env)
+          diagnostic=(result.stdout+result.stderr).replace(token,'[REDACTED]').replace(auth,'[REDACTED]')
           record={'pr':1353,'candidate_branch':branch,'commit':commit,'tree':tree,
                   'original_head':head,'upstream':upstream,'feature_branch':feature,
                   'feature_refs_updated':False,'global_i18n_clean':i18n['global_check_passed'],
-                  'upstream_i18n_exception_exactly_reproduced':i18n['exact_output_equivalent']}
+                  'upstream_i18n_exception_exactly_reproduced':i18n['exact_output_equivalent'],
+                  'push_exit':result.returncode,'push_diagnostic':diagnostic,'candidate_published':False}
+          if result.returncode==0:
+              assert git('ls-remote','origin','refs/heads/'+branch).split()[0]==commit
+              record['candidate_published']=True
           Path('export-receipt.json').write_text(json.dumps(record,indent=2)+'\n')
           print(json.dumps(record,indent=2))
+          if result.returncode:
+              raise SystemExit(result.returncode)
           PY
       - name: Retain isolated export receipt
         if: always()
