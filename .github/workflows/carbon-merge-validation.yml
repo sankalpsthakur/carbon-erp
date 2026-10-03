@@ -1,0 +1,261 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+name: Carbon resolved merge validation
+on:
+  push:
+    branches: [validation/carbon-open-prs-20261003]
+    paths: [.github/workflows/carbon-merge-validation.yml]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/carbon-erp'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pr: 1352
+            head: 6c679df1bad6e77535eda23f14d487827270190e
+          - pr: 1353
+            head: faf8bce8f65d6d2d075e90d54f6bb5f969d1c1fc
+    env:
+      PR_NUMBER: ${{ matrix.pr }}
+      TARGET_SHA: ${{ matrix.head }}
+      UPSTREAM_SHA: 4952e5b3721a904c2e5d51c7d97e895f01b17fc7
+      NODE_OPTIONS: --max-old-space-size=6144
+      TURBO_TELEMETRY_DISABLED: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Fetch pinned source and resolve only inspected conflicts
+        id: resolve
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          git init src
+          git -C src remote add origin https://github.com/sankalpsthakur/carbon-erp.git
+          git -C src remote add upstream https://github.com/crbnos/carbon.git
+          git -C src fetch --no-tags origin "$TARGET_SHA"
+          git -C src checkout --detach FETCH_HEAD
+          git -C src fetch --no-tags upstream "$UPSTREAM_SHA"
+          git -C src config user.name 'Isolated validation runner'
+          git -C src config user.email 'validation@localhost.invalid'
+          cd src
+          python3 - <<'PYCODE'
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          def git(*args, check=True):
+              return subprocess.run(['git', *args], capture_output=True, check=check)
+          def content(ref, path):
+              return git('show', f'{ref}:{path}').stdout
+          pr = int(os.environ['PR_NUMBER'])
+          upstream, head = os.environ['UPSTREAM_SHA'], os.environ['TARGET_SHA']
+          assert git('rev-parse', 'HEAD').stdout.decode().strip() == head
+          merge = git('merge', '--no-commit', '--no-ff', upstream, check=False)
+          Path('../evidence/merge.log').write_bytes(merge.stdout + merge.stderr)
+          if merge.returncode not in (0, 1):
+              raise RuntimeError(f'Unexpected merge failure: {merge.returncode}')
+          conflicts = {p for p in git('diff', '--name-only', '--diff-filter=U', '-z').stdout.decode().split('\0') if p}
+          digest = 'apps/erp/app/routes/api+/mcp+/lib/tool-manifest.digest.json'
+          Path('../evidence/upstream-manifest.json').write_bytes(content(upstream, digest))
+          notes = []
+          if pr == 1352:
+              path = 'apps/erp/app/modules/purchasing/purchasing.service.ts'
+              assert conflicts == {path, digest}, conflicts
+              data = Path(path).read_bytes()
+              assert hashlib.sha256(data).hexdigest() == 'f4929c13911cf9d16b8e05273b51dd643ab9d74199434edd80f16c532ddaecbd'
+              pattern = r'^<<<<<<< HEAD\n(.*?)^=======\n(.*?)^>>>>>>> [0-9a-f]+\n'
+              matches = list(re.finditer(pattern, data.decode(), flags=re.M | re.S))
+              assert len(matches) == 1
+              ours, theirs = matches[0].groups()
+              assert ours.startswith('export async function getPurchaseOrderInvoiceLines(')
+              assert 'getPurchaseOrderInvoicesByIds(' in ours
+              assert ours.count('.eq("companyId", companyId)') == 2
+              assert theirs == '/** @mcp read */\n'
+              fixed = re.sub(pattern, lambda m: m.group(1) + m.group(2), data.decode(), flags=re.M | re.S)
+              assert '/** @mcp read */\nexport async function getPurchaseOrderLine(' in fixed
+              Path(path).write_text(fixed)
+              # No user changes exist in this scratch checkout. The generator runs below.
+              Path(digest).write_bytes(content(upstream, digest))
+              git('add', path, digest)
+              notes.append('Keep both company-scoped helpers and the @mcp read tag on getPurchaseOrderLine; regenerate the digest.')
+          else:
+              path = 'apps/erp/app/routes/x+/users+/employees.new.tsx'
+              modal = 'apps/erp/app/modules/users/ui/Employees/CreateEmployeeModal.tsx'
+              assert conflicts == {path, modal}, conflicts
+              base = git('merge-base', head, upstream).stdout.decode().strip()
+              for p in (path, modal):
+                  before, after = content(base, p), content(upstream, p)
+                  assert after.endswith(before)
+                  prefix = after[:-len(before)]
+                  assert prefix.startswith(b'// SPDX-License-Identifier: AGPL-3.0-only\n')
+                  assert all(not line or line.startswith(b'//') for line in prefix.splitlines())
+              ours = content(head, path)
+              assert hashlib.sha256(ours).hexdigest() == '57cbb2bfce5382942fc29e0d8d2049d3b1698566b575e5450ac3ab75bcf5df00'
+              Path(path).write_bytes(ours)
+              git('rm', modal)
+              git('add', path)
+              notes.append('Keep the bulk-invite redirect and users-create gate; preserve old-modal deletion. Upstream conflicts are header-only; use the official header fixer.')
+          assert not git('ls-files', '-u').stdout
+          record = {'pr': pr, 'head': head, 'upstream': upstream, 'resolution': notes, 'feature_refs_updated': False}
+          Path('../evidence/resolution.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          PYCODE
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 10.33.4
+          run_install: false
+      - name: Install locked workspace dependencies
+        id: install
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile 2>&1 | tee ../evidence/install.log
+      - name: Regenerate official headers, MCP manifest and Lingui catalogs
+        id: generate
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm --filter @carbon/checks license-headers 2>&1 | tee ../evidence/license-headers.log
+          pnpm run generate:mcp 2>&1 | tee ../evidence/generate-mcp.log
+          pnpm run lingui:extract 2>&1 | tee ../evidence/lingui-extract.log
+          pnpm run lingui:clean 2>&1 | tee ../evidence/lingui-clean.log
+          pnpm run lingui:compile 2>&1 | tee ../evidence/lingui-compile.log
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          baseline = json.loads(Path('../evidence/upstream-manifest.json').read_text())
+          current = json.loads(Path('apps/erp/app/routes/api+/mcp+/lib/tool-manifest.digest.json').read_text())
+          before = {t['name'] for t in baseline['tools']}
+          after = {t['name'] for t in current['tools']}
+          record = {'removed_tools': sorted(before - after), 'added_tools': sorted(after - before)}
+          Path('../evidence/mcp-name-comparison.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          assert not record['removed_tools'], 'Merge displaced an existing MCP tool annotation'
+          PYCODE
+          git diff --check
+      - name: Repository Biome checks
+        id: lint
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm exec biome check 2>&1 | tee ../evidence/lint.log
+      - name: Scoped ERP typecheck
+        id: types
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm exec turbo run typecheck --filter=erp 2>&1 | tee ../evidence/typecheck.log
+      - name: Execute PR-specific regression tests
+        id: focused
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ "$PR_NUMBER" = 1352 ]; then
+            pnpm --filter erp exec vitest run \
+              app/modules/invoicing/invoicing.application-history.test.ts \
+              app/modules/invoicing/invoicing.models.test.ts \
+              app/modules/invoicing/invoicing.summary-loaders.test.ts \
+              'app/routes/x+/sales-order+/$orderId.invoice-summary.test.ts' \
+              --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused-tests.json" \
+              2>&1 | tee ../evidence/focused-tests.log
+          else
+            pnpm --filter erp exec vitest run \
+              app/modules/users/users.models.test.ts \
+              test/employee-bulk-invite-action.test.ts \
+              test/employee-bulk-invite-modal.test.ts \
+              test/employee-invite-email-adapter.test.ts \
+              --reporter=default --reporter=json --outputFile="$GITHUB_WORKSPACE/evidence/focused-tests.json" \
+              2>&1 | tee ../evidence/focused-tests.log
+          fi
+      - name: Full repository unit-test tasks
+        id: tests
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm exec turbo run test --concurrency=2 2>&1 | tee ../evidence/repository-tests.log
+      - name: Full production build tasks (no deployment)
+        id: build
+        continue-on-error: true
+        working-directory: src
+        run: |
+          set -euo pipefail
+          pnpm exec turbo run build --concurrency=2 2>&1 | tee ../evidence/production-build.log
+      - name: Capture candidate and truthful check outcomes
+        if: always()
+        env:
+          STEPS_JSON: ${{ toJSON(steps) }}
+        run: |
+          python3 - <<'PYCODE'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          out = Path('evidence')
+          out.mkdir(exist_ok=True)
+          steps = json.loads(os.environ['STEPS_JSON'])
+          required = ['resolve', 'install', 'generate', 'lint', 'types', 'focused', 'tests', 'build']
+          checks = {k: steps.get(k, {}).get('outcome', 'not_run') for k in required}
+          record = {'pr': int(os.environ['PR_NUMBER']), 'head': os.environ['TARGET_SHA'],
+                    'upstream': os.environ['UPSTREAM_SHA'], 'checks': checks,
+                    'all_required_checks_passed': all(v == 'success' for v in checks.values()),
+                    'feature_refs_updated': False, 'human_review_certified': False}
+          focused = out / 'focused-tests.json'
+          if focused.exists():
+              data = json.loads(focused.read_text())
+              record['focused_test_counts'] = {key: data.get(key) for key in (
+                  'numTotalTests', 'numPassedTests', 'numFailedTests', 'numPendingTests')}
+              executed = data.get('numPassedTests', 0) > 0 and data.get('numFailedTests', 0) == 0
+              record['all_required_checks_passed'] &= executed
+          else:
+              record['all_required_checks_passed'] = False
+          if Path('src/.git').exists():
+              def git(*args):
+                  return subprocess.run(['git', '-C', 'src', *args], capture_output=True, check=True).stdout
+              if not git('ls-files', '-u'):
+                  git('add', '-u')
+                  record['candidate_tree'] = git('write-tree').decode().strip()
+                  patch = git('diff', '--cached', '--binary', '--no-renames', os.environ['UPSTREAM_SHA'])
+                  (out / 'candidate-vs-upstream.patch').write_bytes(patch)
+                  record['patch_sha256'] = hashlib.sha256(patch).hexdigest()
+                  entries = git('diff', '--cached', '--name-status', '--no-renames', '-z', os.environ['UPSTREAM_SHA']).decode().split('\0')
+                  changed = []
+                  for i in range(0, len(entries)-1, 2):
+                      status, path = entries[i:i+2]
+                      changed.append({'status': status, 'path': path})
+                      if status != 'D':
+                          p = out / 'candidate-files' / path
+                          p.parent.mkdir(parents=True, exist_ok=True)
+                          p.write_bytes(git('show', ':' + path))
+                  record['changed_files'] = changed
+                  (out / 'diff-stat.txt').write_bytes(git('diff', '--cached', '--stat', os.environ['UPSTREAM_SHA']))
+          (out / 'validation.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('## Candidate validation — feature branches unchanged\n\n```json\n' + json.dumps(record, indent=2) + '\n```\n')
+          PYCODE
+      - name: Retain candidate, logs and test receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: carbon-${{ matrix.pr }}-resolved-candidate
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: error
+      - name: Require every validation gate
+        if: always()
+        run: |
+          python3 - <<'PYCODE'
+          import json
+          from pathlib import Path
+          r = json.loads(Path('evidence/validation.json').read_text())
+          if not r['all_required_checks_passed']:
+              raise SystemExit('Candidate remains unverified: ' + str(r['checks']))
+          PYCODE
